@@ -1,0 +1,56 @@
+name: release
+
+# Push a version tag (v1.0.0) to build + package the plugin and attach the
+# .deskit asset (plus its .sha256) to a GitHub Release. Copy the printed
+# sha256 + the asset download URL into your DesKit-Marketplace listing PR.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build CJS bundle
+        run: npm run build
+
+      - name: Validate manifest
+        run: npm run validate
+
+      - name: Pack .deskit + compute sha256
+        id: pack
+        run: npm run pack
+
+      - name: Create GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+        run: |
+          gh release create "$TAG" \
+            "release/$ASSET" \
+            "release/$ASSET.sha256" \
+            --title "$TAG" \
+            --notes "Automated DesKit plugin build.
+
+          **Asset:** \`$ASSET\`
+          **SHA-256:** \`$SHA256\`
+
+          To list this on the marketplace, open a PR to DesKit-Marketplace
+          with the asset download URL and the sha256 above."

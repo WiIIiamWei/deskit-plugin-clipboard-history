@@ -1,0 +1,230 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/WiIIiamWei/deskit-plugin-clipboard-history/schema/deskit-manifest.schema.json",
+  "title": "DesKit plugin manifest (deskit.json)",
+  "description": "Mirrors the host's zod manifest schema. Keep in sync with the DesKit version in engines.deskit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "displayName",
+    "description",
+    "version",
+    "author",
+    "engines",
+    "main",
+    "contributes"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string",
+      "minLength": 3,
+      "pattern": "^[a-z0-9][a-z0-9-]*(?:\\.[a-z0-9][a-z0-9-]*)+$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "displayName": {
+      "$ref": "#/$defs/localizedString"
+    },
+    "description": {
+      "$ref": "#/$defs/localizedString"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "author": {
+      "type": "string",
+      "minLength": 1
+    },
+    "icon": {
+      "$ref": "#/$defs/relativePath"
+    },
+    "engines": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deskit"
+      ],
+      "properties": {
+        "deskit": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "main": {
+      "$ref": "#/$defs/relativePath"
+    },
+    "contributes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commands"
+      ],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/command"
+          }
+        },
+        "preferences": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/preference"
+          }
+        },
+        "activationEvents": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "clipboard:change"
+            ]
+          }
+        }
+      }
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "localizedString": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      ]
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "pattern": "(^|/)\\.\\.(/|$)|^([A-Za-z]:)?[\\\\/]"
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 3,
+          "pattern": "^[a-z0-9][a-z0-9-]*(?:\\.[a-z0-9][a-z0-9-]*)+$"
+        },
+        "title": {
+          "$ref": "#/$defs/localizedString"
+        },
+        "subtitle": {
+          "$ref": "#/$defs/localizedString"
+        },
+        "keywords": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "mode": {
+          "enum": [
+            "view",
+            "no-view"
+          ],
+          "default": "view"
+        },
+        "icon": {
+          "$ref": "#/$defs/relativePath"
+        }
+      }
+    },
+    "preference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type",
+        "label"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "enum": [
+            "text",
+            "number",
+            "checkbox",
+            "select"
+          ]
+        },
+        "label": {
+          "$ref": "#/$defs/localizedString"
+        },
+        "default": {},
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "value",
+              "label"
+            ],
+            "properties": {
+              "value": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "$ref": "#/$defs/localizedString"
+              }
+            }
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "type": {
+            "const": "select"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "options"
+        ],
+        "properties": {
+          "options": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  }
+}

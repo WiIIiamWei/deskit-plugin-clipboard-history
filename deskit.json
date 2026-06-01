@@ -1,0 +1,95 @@
+{
+  "$schema": "./schema/deskit-manifest.schema.json",
+  "id": "com.deskit.clipboard-history",
+  "name": "clipboard-history",
+  "displayName": {
+    "en": "Clipboard History",
+    "zh-CN": "历史剪贴板"
+  },
+  "description": {
+    "en": "Collect recent clipboard items and paste them from the launcher.",
+    "zh-CN": "记录最近的剪贴板内容，并可从启动器快速粘贴。"
+  },
+  "version": "0.3.0",
+  "author": "DesKit",
+  "engines": {
+    "deskit": "^0.2.0"
+  },
+  "main": "dist/index.js",
+  "contributes": {
+    "activationEvents": [
+      "clipboard:change"
+    ],
+    "commands": [
+      {
+        "id": "clipboard-history.open",
+        "title": {
+          "en": "Clipboard History",
+          "zh-CN": "历史剪贴板"
+        },
+        "subtitle": {
+          "en": "Pick a recent clipboard item to paste",
+          "zh-CN": "选择最近的剪贴板项目并粘贴"
+        },
+        "keywords": [
+          "clipboard",
+          "history",
+          "paste",
+          "copy",
+          "剪贴板",
+          "历史",
+          "粘贴"
+        ],
+        "mode": "view"
+      }
+    ],
+    "preferences": [
+      {
+        "id": "maxItems",
+        "type": "select",
+        "label": {
+          "en": "Maximum history items",
+          "zh-CN": "最大历史条数"
+        },
+        "default": "50",
+        "options": [
+          {
+            "value": "20",
+            "label": "20"
+          },
+          {
+            "value": "50",
+            "label": "50"
+          },
+          {
+            "value": "100",
+            "label": "100"
+          }
+        ]
+      },
+      {
+        "id": "captureImages",
+        "type": "checkbox",
+        "label": {
+          "en": "Capture image clipboard entries",
+          "zh-CN": "记录图片剪贴板"
+        },
+        "default": true
+      },
+      {
+        "id": "captureFiles",
+        "type": "checkbox",
+        "label": {
+          "en": "Capture file clipboard entries",
+          "zh-CN": "记录文件剪贴板"
+        },
+        "default": true
+      }
+    ]
+  },
+  "permissions": [
+    "clipboard:read",
+    "clipboard:write",
+    "storage:plugin"
+  ]
+}
