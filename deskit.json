@@ -12,6 +12,7 @@
   },
   "version": "0.3.0",
   "author": "DesKit",
+  "icon": "lucide:clipboard-list",
   "engines": {
     "deskit": "^0.2.0"
   },
@@ -40,6 +41,7 @@
           "历史",
           "粘贴"
         ],
+        "icon": "lucide:clipboard-list",
         "mode": "view"
       }
     ],

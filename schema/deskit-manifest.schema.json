@@ -44,7 +44,7 @@
       "minLength": 1
     },
     "icon": {
-      "$ref": "#/$defs/relativePath"
+      "$ref": "#/$defs/iconReference"
     },
     "engines": {
       "type": "object",
@@ -121,8 +121,29 @@
       "type": "string",
       "minLength": 1,
       "not": {
-        "pattern": "(^|/)\\.\\.(/|$)|^([A-Za-z]:)?[\\\\/]"
+        "pattern": "(^|/)\\.\\.(/|$)|^([A-Za-z]:)?[\\\\/]|^[a-zA-Z][a-zA-Z0-9+.-]*:"
       }
+    },
+    "iconReference": {
+      "description": "Icon reference. Use lucide:<name> for bundled Lucide icons, or a packaged relative image path.",
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^lucide:[a-z0-9][a-z0-9-]*$"
+        },
+        {
+          "$ref": "#/$defs/iconImagePath"
+        }
+      ]
+    },
+    "iconImagePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\.(?:avif|gif|ico|jpe?g|png|svg|webp)$",
+      "not": {
+        "pattern": "(^|/)\\.\\.(/|$)|^([A-Za-z]:)?[\\\\/]|^[a-zA-Z][a-zA-Z0-9+.-]*:"
+      },
+      "description": "Relative image path packaged inside the plugin .deskit archive."
     },
     "command": {
       "type": "object",
@@ -158,7 +179,7 @@
           "default": "view"
         },
         "icon": {
-          "$ref": "#/$defs/relativePath"
+          "$ref": "#/$defs/iconReference"
         }
       }
     },

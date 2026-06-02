@@ -54,3 +54,7 @@ The plugin requires:
 - `clipboard:read` to receive clipboard-change payloads.
 - `clipboard:write` to place selected content back on the clipboard.
 - `storage:plugin` to persist local history and sync metadata.
+
+The manifest declares `icon: "lucide:clipboard-list"` at both plugin and
+command level. Keep this aligned with the Marketplace listing so installed
+plugins and marketplace cards render the same icon.
