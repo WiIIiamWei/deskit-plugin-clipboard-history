@@ -5,7 +5,6 @@ import type {
   PluginContext,
   PluginModule,
   ToastOnly,
-  View,
 } from "@deskit/plugin-sdk"
 
 const COMMAND_ID = "clipboard-history.open"
@@ -63,7 +62,6 @@ const plugin: PluginModule = {
       async onAction(actionId, payload, ctx) {
         if (actionId === "select-item") return handleSelectItem(payload, ctx)
         if (actionId === "clear-history") return handleClearHistory(ctx)
-        if (actionId === "mark-sync-ready") return handleMarkSyncReady(payload, ctx)
         return undefined
       },
     },
@@ -126,10 +124,6 @@ async function makeView(rawInput: string, ctx: PluginContext): Promise<ListView>
         title: t(locale, "Controls", "控制"),
         items: controlItems(state, locale),
       },
-      {
-        title: t(locale, "Future sync", "后续同步"),
-        items: syncItems(state.sync, locale),
-      },
     ],
   }
 }
@@ -169,26 +163,6 @@ async function handleClearHistory(ctx: PluginContext): Promise<ToastOnly> {
   }
 }
 
-async function handleMarkSyncReady(payload: unknown, ctx: PluginContext): Promise<View> {
-  const provider = extractStringField(payload, "provider") ?? DEFAULT_SYNC_PROVIDER
-  const state = await readState(ctx)
-  state.sync = {
-    ...state.sync,
-    provider,
-    enabled: false,
-    lastSyncedAt: Date.now(),
-  }
-  await writeState(ctx, state)
-  return {
-    type: "toast",
-    level: "info",
-    message: t(
-      normalizeLocale(ctx.locale),
-      `Sync placeholder saved for ${provider}`,
-      `已为 ${provider} 保存同步预留状态`
-    ),
-  }
-}
 
 async function readState(ctx: PluginContext): Promise<ClipboardHistoryState> {
   return normalizeState(await ctx.storage.get(HISTORY_STORAGE_KEY))
@@ -268,17 +242,6 @@ function emptyItem(locale: Locale, query: string): ListItem {
 function controlItems(state: ClipboardHistoryState, locale: Locale): ListItem[] {
   return [
     {
-      id: "control:shortcut",
-      title: t(locale, "Preferred shortcut: Win+Ctrl+C", "建议快捷键：Win+Ctrl+C"),
-      subtitle: t(
-        locale,
-        "Change this shortcut from the plugin settings page.",
-        "可在插件设置页修改这个快捷键。"
-      ),
-      icon: "lucide:keyboard",
-      actions: [],
-    },
-    {
       id: "control:clear",
       title: t(locale, "Clear history", "清空历史"),
       subtitle: t(locale, `${state.items.length} item(s) stored`, `已保存 ${state.items.length} 项`),
@@ -294,28 +257,6 @@ function controlItems(state: ClipboardHistoryState, locale: Locale): ListItem[] 
   ]
 }
 
-function syncItems(sync: ClipboardSyncState, locale: Locale): ListItem[] {
-  return [
-    {
-      id: "sync:placeholder",
-      title: t(locale, "Sync adapter placeholder", "同步适配器预留"),
-      subtitle: t(
-        locale,
-        `${sync.provider} · ${sync.enabled ? "enabled" : "disabled"} · local-only build`,
-        `${sync.provider} · ${sync.enabled ? "已启用" : "未启用"} · 当前仅本地`
-      ),
-      icon: "lucide:cloud",
-      actions: [
-        {
-          type: "custom",
-          id: "mark-sync-ready",
-          label: t(locale, "Keep local", "保持本地"),
-          payload: { provider: sync.provider },
-        },
-      ],
-    },
-  ]
-}
 
 function normalizeState(value: unknown): ClipboardHistoryState {
   if (!value || typeof value !== "object") return defaultState()
