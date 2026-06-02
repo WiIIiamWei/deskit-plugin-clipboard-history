@@ -272,8 +272,8 @@ function controlItems(state: ClipboardHistoryState, locale: Locale): ListItem[] 
       title: t(locale, "Preferred shortcut: Win+Ctrl+C", "建议快捷键：Win+Ctrl+C"),
       subtitle: t(
         locale,
-        "Host support is reserved; today the command opens from DesKit launcher search.",
-        "宿主侧能力已预留；当前可从 DesKit 启动器搜索打开。"
+        "Change this shortcut from the plugin settings page.",
+        "可在插件设置页修改这个快捷键。"
       ),
       icon: "lucide:keyboard",
       actions: [],

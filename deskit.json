@@ -47,6 +47,16 @@
     ],
     "preferences": [
       {
+        "id": "openShortcut",
+        "type": "shortcut",
+        "label": {
+          "en": "Open shortcut",
+          "zh-CN": "打开快捷键"
+        },
+        "default": "Super+Control+C",
+        "command": "clipboard-history.open"
+      },
+      {
         "id": "maxItems",
         "type": "select",
         "label": {
