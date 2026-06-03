@@ -7,8 +7,8 @@
     "zh-CN": "历史剪贴板"
   },
   "description": {
-    "en": "Collect recent clipboard items and paste them from the launcher.",
-    "zh-CN": "记录最近的剪贴板内容，并可从启动器快速粘贴。"
+    "en": "Collect recent clipboard items and copy them back from the launcher.",
+    "zh-CN": "记录最近的剪贴板内容，并可从启动器快速复制。"
   },
   "version": "0.3.1",
   "author": "DesKit",
@@ -29,17 +29,16 @@
           "zh-CN": "历史剪贴板"
         },
         "subtitle": {
-          "en": "Pick a recent clipboard item to paste",
-          "zh-CN": "选择最近的剪贴板项目并粘贴"
+          "en": "Pick a recent clipboard item to copy",
+          "zh-CN": "选择最近的剪贴板项目并复制"
         },
         "keywords": [
           "clipboard",
           "history",
-          "paste",
           "copy",
           "剪贴板",
           "历史",
-          "粘贴"
+          "复制"
         ],
         "icon": "lucide:clipboard-list",
         "mode": "view"

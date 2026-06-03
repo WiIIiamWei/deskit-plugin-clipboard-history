@@ -14,8 +14,10 @@ const DEFAULT_SEARCH_LIMIT = 20
 const DEFAULT_LOCALE: Locale = "en"
 const DEFAULT_SYNC_PROVIDER = "local"
 const MAX_PREVIEW_LENGTH = 140
+const SELF_WRITE_IGNORE_MS = 3_000
 
 let captureQueue: Promise<void> = Promise.resolve()
+const ignoredClipboardFingerprints = new Map<string, number>()
 
 interface ClipboardChangeEvent {
   content: ClipboardContent
@@ -33,7 +35,6 @@ interface ClipboardHistoryItem {
 
 interface ClipboardHistoryState {
   items: ClipboardHistoryItem[]
-  lastSelectedId?: string
   sync: ClipboardSyncState
 }
 
@@ -60,7 +61,7 @@ const plugin: PluginModule = {
         return makeView(text, ctx)
       },
       async onAction(actionId, payload, ctx) {
-        if (actionId === "select-item") return handleSelectItem(payload, ctx)
+        if (actionId === "copy-item") return handleCopyItem(payload, ctx)
         if (actionId === "clear-history") return handleClearHistory(ctx)
         return undefined
       },
@@ -80,9 +81,11 @@ async function captureClipboardContent(content: ClipboardContent, ctx: PluginCon
   const preferences = readPreferences(ctx)
   if (!shouldCapture(content, preferences)) return
 
+  const fingerprint = fingerprintContent(content)
+  if (shouldIgnoreClipboardFingerprint(fingerprint)) return
+
   const state = await readState(ctx)
   const now = Date.now()
-  const fingerprint = fingerprintContent(content)
   const nextItem: ClipboardHistoryItem = {
     id: fingerprint,
     content,
@@ -97,7 +100,6 @@ async function captureClipboardContent(content: ClipboardContent, ctx: PluginCon
     0,
     preferences.maxItems
   )
-  state.lastSelectedId ??= nextItem.id
   await writeState(ctx, state)
 }
 
@@ -106,10 +108,7 @@ async function makeView(rawInput: string, ctx: PluginContext): Promise<ListView>
   const preferences = readPreferences(ctx)
   const state = await readState(ctx)
   const filtered = filterItems(state.items, rawInput, preferences.maxItems)
-  const selectedId = state.lastSelectedId ?? filtered[0]?.id
-  const historyItems = filtered
-    .slice(0, DEFAULT_SEARCH_LIMIT)
-    .map((item) => toListItem(item, locale, item.id === selectedId))
+  const historyItems = filtered.slice(0, DEFAULT_SEARCH_LIMIT).map((item) => toListItem(item, locale))
 
   return {
     type: "list",
@@ -128,7 +127,7 @@ async function makeView(rawInput: string, ctx: PluginContext): Promise<ListView>
   }
 }
 
-async function handleSelectItem(payload: unknown, ctx: PluginContext): Promise<ToastOnly | ListView> {
+async function handleCopyItem(payload: unknown, ctx: PluginContext): Promise<ToastOnly | ListView> {
   const itemId = extractStringField(payload, "itemId")
   if (!itemId) return makeView("", ctx)
 
@@ -136,17 +135,22 @@ async function handleSelectItem(payload: unknown, ctx: PluginContext): Promise<T
   const item = state.items.find((candidate) => candidate.id === itemId)
   if (!item) return makeView("", ctx)
 
-  state.lastSelectedId = item.id
-  await writeState(ctx, state)
-  await ctx.clipboard.write(item.content)
+  const fingerprint = fingerprintContent(item.content)
+  markSelfWrittenClipboardFingerprint(fingerprint)
+  try {
+    await ctx.clipboard.write(item.content)
+  } catch (err) {
+    ignoredClipboardFingerprints.delete(fingerprint)
+    throw err
+  }
 
   return {
     type: "toast",
     level: "success",
     message: t(
       normalizeLocale(ctx.locale),
-      `Copied for paste: ${item.preview}`,
-      `已复制，准备粘贴：${item.preview}`
+      `Copied: ${item.preview}`,
+      `已复制：${item.preview}`
     ),
   }
 }
@@ -154,7 +158,6 @@ async function handleSelectItem(payload: unknown, ctx: PluginContext): Promise<T
 async function handleClearHistory(ctx: PluginContext): Promise<ToastOnly> {
   const state = await readState(ctx)
   state.items = []
-  state.lastSelectedId = undefined
   await writeState(ctx, state)
   return {
     type: "toast",
@@ -170,6 +173,25 @@ async function readState(ctx: PluginContext): Promise<ClipboardHistoryState> {
 
 async function writeState(ctx: PluginContext, state: ClipboardHistoryState): Promise<void> {
   await ctx.storage.set(HISTORY_STORAGE_KEY, normalizeState(state))
+}
+
+function markSelfWrittenClipboardFingerprint(fingerprint: string): void {
+  pruneIgnoredClipboardFingerprints()
+  ignoredClipboardFingerprints.set(fingerprint, Date.now() + SELF_WRITE_IGNORE_MS)
+}
+
+function shouldIgnoreClipboardFingerprint(fingerprint: string): boolean {
+  pruneIgnoredClipboardFingerprints()
+  const expiresAt = ignoredClipboardFingerprints.get(fingerprint)
+  if (!expiresAt) return false
+  ignoredClipboardFingerprints.delete(fingerprint)
+  return expiresAt > Date.now()
+}
+
+function pruneIgnoredClipboardFingerprints(now = Date.now()): void {
+  for (const [fingerprint, expiresAt] of ignoredClipboardFingerprints) {
+    if (expiresAt <= now) ignoredClipboardFingerprints.delete(fingerprint)
+  }
 }
 
 function readPreferences(ctx: PluginContext): ClipboardHistoryPreferenceSet {
@@ -197,28 +219,18 @@ function filterItems(items: ClipboardHistoryItem[], query: string, maxItems: num
   })
 }
 
-function toListItem(item: ClipboardHistoryItem, locale: Locale, selected: boolean): ListItem {
+function toListItem(item: ClipboardHistoryItem, locale: Locale): ListItem {
   return {
     id: item.id,
     title: item.preview,
     subtitle: t(locale, item.kindLabel, item.kindLabel),
-    accessory: selected ? t(locale, "Selected", "已选中") : formatRelativeAge(item.updatedAt, locale),
+    accessory: formatRelativeAge(item.updatedAt, locale),
     icon: iconForContent(item.content),
     actions: [
       {
-        type: "paste",
-        label: t(locale, "Paste", "粘贴"),
-        value: item.content,
-      },
-      {
-        type: "copy",
-        label: t(locale, "Copy", "复制"),
-        value: item.content,
-      },
-      {
         type: "custom",
-        id: "select-item",
-        label: t(locale, "Select", "选中"),
+        id: "copy-item",
+        label: t(locale, "Copy", "复制"),
         payload: { itemId: item.id },
       },
     ],
@@ -264,9 +276,8 @@ function normalizeState(value: unknown): ClipboardHistoryState {
   const items = Array.isArray(record.items)
     ? (record.items.map(normalizeItem).filter(Boolean) as ClipboardHistoryItem[])
     : []
-  const lastSelectedId = typeof record.lastSelectedId === "string" ? record.lastSelectedId : undefined
   const sync = normalizeSync(record.sync)
-  return { items, lastSelectedId, sync }
+  return { items, sync }
 }
 
 function normalizeItem(value: unknown): ClipboardHistoryItem | null {

@@ -7,20 +7,20 @@ A DesKit plugin that records clipboard changes and shows a searchable clipboard 
 - Records text, image, and file clipboard entries through `activationEvents: ["clipboard:change"]`.
 - De-duplicates repeated clipboard content and keeps the newest entry first.
 - Shows a searchable list in DesKit.
-- Pressing `Enter` on a history row uses the primary `paste` action exposed by DesKit.
-- Also exposes explicit `Copy`, `Paste`, and `Select` actions on each item.
+- Pressing `Enter` on a history row copies that item back to the clipboard.
+- Each history item exposes a single `Copy` action.
+- Self-triggered copies are ignored by the history collector so copied history items are not re-added.
 - Stores history locally with `storage:plugin`.
 
 ## Current Host Boundary
 
-The intended user shortcut is `Win+Ctrl+C`. The current DesKit host can open plugin commands from the launcher and can execute `paste` actions by writing clipboard content and closing the launcher. A dedicated plugin-owned global shortcut and true OS-level “paste into the previous focused app” still need host support.
+The intended user shortcut is `Win+Ctrl+C`. The current DesKit host can open plugin commands from the launcher, but it cannot reliably paste into the previously focused text field after the DesKit window opens. This plugin therefore copies the selected history item back to the clipboard and lets the user paste it manually.
 
-This plugin therefore keeps the command and data shape ready for that host integration:
+This plugin keeps the command and data shape ready for future host integration:
 
 - command id: `clipboard-history.open`
 - preferred shortcut: `Win+Ctrl+C`
-- primary row action: `paste`
-- selected item state: `lastSelectedId`
+- primary row action: `copy`
 
 ## Future Sync Interface
 
@@ -45,7 +45,7 @@ npm run check
 npm run pack
 ```
 
-The package command emits `release/com.deskit.clipboard-history-0.3.0.deskit` and a `.sha256` file.
+The package command emits `release/com.deskit.clipboard-history-0.3.1.deskit` and a `.sha256` file.
 
 ## Manifest
 
