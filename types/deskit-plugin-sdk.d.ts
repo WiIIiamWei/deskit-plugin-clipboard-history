@@ -28,44 +28,60 @@ declare module "@deskit/plugin-sdk" {
   export interface CopyAction {
     type: "copy"
     label?: LocalizedString
+    icon?: string
+    active?: boolean
     value: ClipboardActionValue
     shortcut?: string
   }
   export interface PasteAction {
     type: "paste"
     label?: LocalizedString
+    icon?: string
+    active?: boolean
     value: ClipboardActionValue
     shortcut?: string
   }
   export interface OpenUrlAction {
     type: "open-url"
     label?: LocalizedString
+    icon?: string
+    active?: boolean
     url: string
     shortcut?: string
   }
   export interface OpenPathAction {
     type: "open-path"
     label?: LocalizedString
+    icon?: string
+    active?: boolean
     path: string
     shortcut?: string
   }
   export interface RunCommandAction {
     type: "run-command"
     label?: LocalizedString
+    icon?: string
+    active?: boolean
     commandId: string
     args?: unknown
   }
   export interface SubmitAction {
     type: "submit"
     label?: LocalizedString
+    icon?: string
+    active?: boolean
   }
   export interface CloseAction {
     type: "close"
     label?: LocalizedString
+    icon?: string
+    active?: boolean
   }
   export interface CustomAction {
     type: "custom"
     label: LocalizedString
+    icon?: string
+    active?: boolean
     id: string
     payload?: unknown
   }
