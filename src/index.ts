@@ -12,16 +12,23 @@ const HISTORY_STORAGE_KEY = "clipboard-history.state"
 const DEFAULT_MAX_ITEMS = 50
 const DEFAULT_SEARCH_LIMIT = 20
 const DEFAULT_LOCALE: Locale = "en"
+const DEFAULT_FILTER: ClipboardHistoryFilter = "all"
 const DEFAULT_SYNC_PROVIDER = "local"
+const WEBDAV_SYNC_PROVIDER = "webdav"
+const DEFAULT_WEBDAV_PATH = "deskit/clipboard-history.json"
+const WEBDAV_TIMEOUT_MS = 4_000
 const MAX_PREVIEW_LENGTH = 140
 const SELF_WRITE_IGNORE_MS = 3_000
 
 let captureQueue: Promise<void> = Promise.resolve()
+let syncQueue: Promise<void> = Promise.resolve()
 const ignoredClipboardFingerprints = new Map<string, number>()
 
 interface ClipboardChangeEvent {
   content: ClipboardContent
 }
+
+type ClipboardHistoryFilter = "all" | ClipboardContent["type"]
 
 interface ClipboardHistoryItem {
   id: string
@@ -30,12 +37,15 @@ interface ClipboardHistoryItem {
   kind: ClipboardContent["type"]
   kindLabel: string
   updatedAt: number
+  favorite: boolean
+  favoriteUpdatedAt?: number
   source: "local" | "sync"
 }
 
 interface ClipboardHistoryState {
   items: ClipboardHistoryItem[]
   sync: ClipboardSyncState
+  filter: ClipboardHistoryFilter
 }
 
 interface ClipboardSyncState {
@@ -43,13 +53,35 @@ interface ClipboardSyncState {
   enabled: boolean
   cursor?: string
   lastSyncedAt?: number
+  lastError?: string
 }
 
 interface ClipboardHistoryPreferenceSet {
   maxItems: number
   captureImages: boolean
   captureFiles: boolean
+  webdavEnabled: boolean
+  webdavUrl: string
+  webdavUsername: string
+  webdavPassword: string
+  webdavPath: string
 }
+
+interface WebDavSyncDocument {
+  version: 1
+  pluginId: string
+  updatedAt: number
+  items: ClipboardHistoryItem[]
+}
+
+interface WebDavResponse {
+  status: number
+  statusText: string
+  ok: boolean
+  body: string
+}
+
+type ListSection = { title?: string; items: ListItem[] }
 
 const plugin: PluginModule = {
   commands: {
@@ -62,6 +94,9 @@ const plugin: PluginModule = {
       },
       async onAction(actionId, payload, ctx) {
         if (actionId === "copy-item") return handleCopyItem(payload, ctx)
+        if (actionId === "toggle-favorite") return handleToggleFavorite(payload, ctx)
+        if (actionId === "set-filter") return handleSetFilter(payload, ctx)
+        if (actionId === "sync-now") return handleSyncNow(ctx)
         if (actionId === "clear-history") return handleClearHistory(ctx)
         return undefined
       },
@@ -85,6 +120,7 @@ async function captureClipboardContent(content: ClipboardContent, ctx: PluginCon
   if (shouldIgnoreClipboardFingerprint(fingerprint)) return
 
   const state = await readState(ctx)
+  const existing = state.items.find((item) => item.id === fingerprint)
   const now = Date.now()
   const nextItem: ClipboardHistoryItem = {
     id: fingerprint,
@@ -93,35 +129,35 @@ async function captureClipboardContent(content: ClipboardContent, ctx: PluginCon
     kind: content.type,
     kindLabel: kindLabel(content),
     updatedAt: now,
+    favorite: existing?.favorite ?? false,
+    favoriteUpdatedAt: existing?.favoriteUpdatedAt,
     source: "local",
   }
 
-  state.items = [nextItem, ...state.items.filter((item) => item.id !== fingerprint)].slice(
-    0,
+  state.items = limitStoredItems(
+    [nextItem, ...state.items.filter((item) => item.id !== fingerprint)],
     preferences.maxItems
   )
   await writeState(ctx, state)
+  queueWebDavSync(ctx)
 }
 
 async function makeView(rawInput: string, ctx: PluginContext): Promise<ListView> {
   const locale = normalizeLocale(ctx.locale)
   const preferences = readPreferences(ctx)
   const state = await readState(ctx)
-  const filtered = filterItems(state.items, rawInput, preferences.maxItems)
-  const historyItems = filtered.slice(0, DEFAULT_SEARCH_LIMIT).map((item) => toListItem(item, locale))
+  const filtered = filterItems(state.items, rawInput, state.filter)
+  const sections = historySections(filtered, state.filter, locale, rawInput)
 
   return {
     type: "list",
     searchPlaceholder: t(locale, "Search clipboard history…", "搜索剪贴板历史…"),
     emptyText: t(locale, "No clipboard history yet", "还没有剪贴板历史"),
     sections: [
-      {
-        title: t(locale, "History", "历史记录"),
-        items: historyItems.length > 0 ? historyItems : [emptyItem(locale, rawInput)],
-      },
+      ...sections,
       {
         title: t(locale, "Controls", "控制"),
-        items: controlItems(state, locale),
+        items: controlItems(state, preferences, locale),
       },
     ],
   }
@@ -135,37 +171,108 @@ async function handleCopyItem(payload: unknown, ctx: PluginContext): Promise<Toa
   const item = state.items.find((candidate) => candidate.id === itemId)
   if (!item) return makeView("", ctx)
 
-  const fingerprint = fingerprintContent(item.content)
-  markSelfWrittenClipboardFingerprint(fingerprint)
+  const selfWriteFingerprints = [fingerprintContent(item.content)]
+  if (item.content.type === "file") {
+    selfWriteFingerprints.push(
+      fingerprintContent({ type: "text", text: item.content.paths.join("\n") })
+    )
+  }
+  for (const fingerprint of selfWriteFingerprints) markSelfWrittenClipboardFingerprint(fingerprint)
   try {
     await ctx.clipboard.write(item.content)
   } catch (err) {
-    ignoredClipboardFingerprints.delete(fingerprint)
+    for (const fingerprint of selfWriteFingerprints) ignoredClipboardFingerprints.delete(fingerprint)
     throw err
   }
 
   return {
     type: "toast",
     level: "success",
-    message: t(
-      normalizeLocale(ctx.locale),
-      `Copied: ${item.preview}`,
-      `已复制：${item.preview}`
-    ),
+    message: t(normalizeLocale(ctx.locale), `Copied: ${item.preview}`, `已复制：${item.preview}`),
+  }
+}
+
+async function handleToggleFavorite(payload: unknown, ctx: PluginContext): Promise<ListView> {
+  const itemId = extractStringField(payload, "itemId")
+  const state = await readState(ctx)
+  const item = state.items.find((candidate) => candidate.id === itemId)
+  if (!item) return makeView("", ctx)
+
+  item.favorite = !item.favorite
+  item.favoriteUpdatedAt = Date.now()
+  state.items = limitStoredItems(state.items, readPreferences(ctx).maxItems)
+  await writeState(ctx, state)
+  queueWebDavSync(ctx)
+  return makeView("", ctx)
+}
+
+async function handleSetFilter(payload: unknown, ctx: PluginContext): Promise<ListView> {
+  const filter = normalizeFilter(extractStringField(payload, "filter"))
+  const state = await readState(ctx)
+  state.filter = filter
+  await writeState(ctx, state)
+  return makeView("", ctx)
+}
+
+async function handleSyncNow(ctx: PluginContext): Promise<ToastOnly> {
+  const locale = normalizeLocale(ctx.locale)
+  const preferences = readPreferences(ctx)
+  if (!preferences.webdavEnabled) {
+    return {
+      type: "toast",
+      level: "info",
+      message: t(locale, "WebDAV sync is disabled", "WebDAV 同步未启用"),
+    }
+  }
+  if (!isWebDavSyncReady(preferences)) {
+    return {
+      type: "toast",
+      level: "warning",
+      message: t(locale, "WebDAV credentials are incomplete", "WebDAV 凭据不完整"),
+    }
+  }
+
+  try {
+    const state = await syncStateWithWebDav(ctx)
+    return {
+      type: "toast",
+      level: "success",
+      message: t(
+        locale,
+        `Synced ${state.items.length} clipboard item(s)`,
+        `已同步 ${state.items.length} 条剪贴板记录`
+      ),
+    }
+  } catch (err) {
+    return {
+      type: "toast",
+      level: "error",
+      message: t(
+        locale,
+        `WebDAV sync failed: ${errorMessage(err)}`,
+        `WebDAV 同步失败：${errorMessage(err)}`
+      ),
+    }
   }
 }
 
 async function handleClearHistory(ctx: PluginContext): Promise<ToastOnly> {
   const state = await readState(ctx)
-  state.items = []
+  const favoriteItems = state.items.filter((item) => item.favorite)
+  const removedCount = state.items.length - favoriteItems.length
+  state.items = favoriteItems
   await writeState(ctx, state)
+  queueWebDavSync(ctx)
   return {
     type: "toast",
     level: "success",
-    message: t(normalizeLocale(ctx.locale), "Clipboard history cleared", "已清空剪贴板历史"),
+    message: t(
+      normalizeLocale(ctx.locale),
+      `Cleared ${removedCount} unstarred item(s); favorites were kept`,
+      `已清空 ${removedCount} 条未收藏记录，收藏项已保留`
+    ),
   }
 }
-
 
 async function readState(ctx: PluginContext): Promise<ClipboardHistoryState> {
   return normalizeState(await ctx.storage.get(HISTORY_STORAGE_KEY))
@@ -173,6 +280,212 @@ async function readState(ctx: PluginContext): Promise<ClipboardHistoryState> {
 
 async function writeState(ctx: PluginContext, state: ClipboardHistoryState): Promise<void> {
   await ctx.storage.set(HISTORY_STORAGE_KEY, normalizeState(state))
+}
+
+function queueWebDavSync(ctx: PluginContext): void {
+  if (!isWebDavSyncReady(readPreferences(ctx))) return
+  syncQueue = syncQueue
+    .then(() => syncStateWithWebDav(ctx).then(() => undefined))
+    .catch((err) => ctx.log("failed to sync clipboard history", err))
+}
+
+async function syncStateWithWebDav(ctx: PluginContext): Promise<ClipboardHistoryState> {
+  const preferences = readPreferences(ctx)
+  if (!isWebDavSyncReady(preferences)) {
+    throw new Error("WebDAV sync is not configured")
+  }
+
+  try {
+    const remoteItems = await readWebDavItems(ctx, preferences)
+    const current = await readState(ctx)
+    const now = Date.now()
+    const nextState: ClipboardHistoryState = {
+      ...current,
+      items: limitStoredItems(
+        mergeClipboardItems(current.items, remoteItems),
+        preferences.maxItems
+      ),
+      sync: {
+        provider: WEBDAV_SYNC_PROVIDER,
+        enabled: true,
+        lastSyncedAt: now,
+      },
+    }
+    await ensureWebDavCollections(ctx, preferences)
+    await writeWebDavState(ctx, preferences, nextState, now)
+    await writeState(ctx, nextState)
+    return nextState
+  } catch (err) {
+    await recordSyncError(ctx, err)
+    throw err
+  }
+}
+
+async function readWebDavItems(
+  ctx: PluginContext,
+  preferences: ClipboardHistoryPreferenceSet
+): Promise<ClipboardHistoryItem[]> {
+  const response = await webDavRequest(ctx, preferences, webDavFileUrl(preferences), "GET")
+  if (response.status === 404) return []
+  if (!response.ok) throw new Error(`GET ${response.status} ${response.statusText}`)
+  if (!response.body.trim()) return []
+
+  const parsed = JSON.parse(response.body) as unknown
+  if (!parsed || typeof parsed !== "object") return []
+  const items = (parsed as { items?: unknown }).items
+  if (!Array.isArray(items)) return []
+  return items.map(normalizeItem).filter(isClipboardHistoryItem).map(asSyncedItem)
+}
+
+async function writeWebDavState(
+  ctx: PluginContext,
+  preferences: ClipboardHistoryPreferenceSet,
+  state: ClipboardHistoryState,
+  updatedAt: number
+): Promise<void> {
+  const document: WebDavSyncDocument = {
+    version: 1,
+    pluginId: ctx.pluginId,
+    updatedAt,
+    items: sortItems(state.items),
+  }
+  const response = await webDavRequest(
+    ctx,
+    preferences,
+    webDavFileUrl(preferences),
+    "PUT",
+    `${JSON.stringify(document, null, 2)}\n`
+  )
+  if (!response.ok) throw new Error(`PUT ${response.status} ${response.statusText}`)
+}
+
+async function ensureWebDavCollections(
+  ctx: PluginContext,
+  preferences: ClipboardHistoryPreferenceSet
+): Promise<void> {
+  const segments = webDavPathSegments(preferences.webdavPath).slice(0, -1)
+  let currentPath = ""
+  for (const segment of segments) {
+    currentPath = currentPath ? `${currentPath}/${segment}` : segment
+    const response = await webDavRequest(
+      ctx,
+      preferences,
+      buildWebDavUrl(preferences.webdavUrl, currentPath, true),
+      "MKCOL"
+    )
+    if (![200, 201, 405].includes(response.status)) {
+      throw new Error(`MKCOL ${response.status} ${response.statusText}`)
+    }
+  }
+}
+
+async function webDavRequest(
+  ctx: PluginContext,
+  preferences: ClipboardHistoryPreferenceSet,
+  url: string,
+  method: string,
+  body?: string
+): Promise<WebDavResponse> {
+  if (!ctx.network) throw new Error("DesKit network API is not available")
+  return ctx.network.request(url, {
+    method,
+    headers: webDavHeaders(preferences, body !== undefined),
+    ...(body !== undefined ? { body } : {}),
+    timeoutMs: WEBDAV_TIMEOUT_MS,
+  })
+}
+
+async function recordSyncError(ctx: PluginContext, err: unknown): Promise<void> {
+  const state = await readState(ctx)
+  state.sync = {
+    provider: WEBDAV_SYNC_PROVIDER,
+    enabled: true,
+    lastSyncedAt: state.sync.lastSyncedAt,
+    lastError: truncateWhitespace(errorMessage(err), 120),
+  }
+  await writeState(ctx, state)
+}
+
+function webDavHeaders(
+  preferences: ClipboardHistoryPreferenceSet,
+  hasBody: boolean
+): Record<string, string> {
+  return {
+    Accept: "application/json",
+    Authorization: `Basic ${base64Encode(`${preferences.webdavUsername}:${preferences.webdavPassword}`)}`,
+    ...(hasBody ? { "Content-Type": "application/json; charset=utf-8" } : {}),
+  }
+}
+
+function webDavFileUrl(preferences: ClipboardHistoryPreferenceSet): string {
+  return buildWebDavUrl(preferences.webdavUrl, preferences.webdavPath, false)
+}
+
+function buildWebDavUrl(baseUrl: string, remotePath: string, trailingSlash: boolean): string {
+  const root = baseUrl.trim().replace(/\/+$/, "")
+  const encodedPath = webDavPathSegments(remotePath).map(encodeURIComponent).join("/")
+  return `${root}/${encodedPath}${trailingSlash ? "/" : ""}`
+}
+
+function webDavPathSegments(remotePath: string): string[] {
+  const segments = remotePath
+    .split(/[\\/]+/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment && segment !== "." && segment !== "..")
+  return segments.length > 0 ? segments : DEFAULT_WEBDAV_PATH.split("/")
+}
+
+function isWebDavSyncReady(preferences: ClipboardHistoryPreferenceSet): boolean {
+  return (
+    preferences.webdavEnabled &&
+    preferences.webdavUrl.length > 0 &&
+    preferences.webdavUsername.length > 0 &&
+    preferences.webdavPassword.length > 0
+  )
+}
+
+function mergeClipboardItems(
+  localItems: ClipboardHistoryItem[],
+  remoteItems: ClipboardHistoryItem[]
+): ClipboardHistoryItem[] {
+  const merged = new Map<string, ClipboardHistoryItem>()
+  for (const item of localItems) merged.set(item.id, { ...item, source: "local" })
+  for (const remoteItem of remoteItems) {
+    const existing = merged.get(remoteItem.id)
+    merged.set(remoteItem.id, existing ? mergeClipboardItem(existing, remoteItem) : remoteItem)
+  }
+  return sortItems([...merged.values()])
+}
+
+function mergeClipboardItem(
+  localItem: ClipboardHistoryItem,
+  remoteItem: ClipboardHistoryItem
+): ClipboardHistoryItem {
+  const contentItem = remoteItem.updatedAt > localItem.updatedAt ? remoteItem : localItem
+  const localFavoriteAt = localItem.favoriteUpdatedAt ?? localItem.updatedAt
+  const remoteFavoriteAt = remoteItem.favoriteUpdatedAt ?? remoteItem.updatedAt
+  if (remoteFavoriteAt > localFavoriteAt) {
+    return {
+      ...contentItem,
+      favorite: remoteItem.favorite,
+      favoriteUpdatedAt: remoteItem.favoriteUpdatedAt,
+      source: contentItem === remoteItem ? "sync" : localItem.source,
+    }
+  }
+  if (localFavoriteAt > remoteFavoriteAt) {
+    return {
+      ...contentItem,
+      favorite: localItem.favorite,
+      favoriteUpdatedAt: localItem.favoriteUpdatedAt,
+      source: contentItem === remoteItem ? "sync" : localItem.source,
+    }
+  }
+  return {
+    ...contentItem,
+    favorite: localItem.favorite || remoteItem.favorite,
+    favoriteUpdatedAt: localItem.favoriteUpdatedAt ?? remoteItem.favoriteUpdatedAt,
+    source: contentItem === remoteItem ? "sync" : localItem.source,
+  }
 }
 
 function markSelfWrittenClipboardFingerprint(fingerprint: string): void {
@@ -200,37 +513,108 @@ function readPreferences(ctx: PluginContext): ClipboardHistoryPreferenceSet {
     maxItems: Number.isFinite(maxItems) && maxItems > 0 ? maxItems : DEFAULT_MAX_ITEMS,
     captureImages: ctx.preferences.captureImages !== false,
     captureFiles: ctx.preferences.captureFiles !== false,
+    webdavEnabled: ctx.preferences.webdavEnabled === true,
+    webdavUrl: readStringPreference(ctx, "webdavUrl"),
+    webdavUsername: readStringPreference(ctx, "webdavUsername"),
+    webdavPassword: readStringPreference(ctx, "webdavPassword", false),
+    webdavPath: readStringPreference(ctx, "webdavPath") || DEFAULT_WEBDAV_PATH,
   }
 }
 
-function shouldCapture(content: ClipboardContent, preferences: ClipboardHistoryPreferenceSet): boolean {
+function readStringPreference(ctx: PluginContext, key: string, trim = true): string {
+  const value = ctx.preferences[key]
+  if (typeof value !== "string") return ""
+  return trim ? value.trim() : value
+}
+
+function shouldCapture(
+  content: ClipboardContent,
+  preferences: ClipboardHistoryPreferenceSet
+): boolean {
   if (content.type === "text") return content.text.trim().length > 0
   if (content.type === "image") return preferences.captureImages
   return preferences.captureFiles && content.paths.length > 0
 }
 
-function filterItems(items: ClipboardHistoryItem[], query: string, maxItems: number): ClipboardHistoryItem[] {
+function filterItems(
+  items: ClipboardHistoryItem[],
+  query: string,
+  filter: ClipboardHistoryFilter
+): ClipboardHistoryItem[] {
   const trimmed = query.trim().toLowerCase()
-  const scoped = items.slice(0, maxItems)
-  if (!trimmed) return scoped
-  return scoped.filter((item) => {
-    const haystack = `${item.preview} ${item.kindLabel} ${item.kind} ${item.source}`.toLowerCase()
-    return haystack.includes(trimmed)
-  })
+  const scoped = filter === "all" ? items : items.filter((item) => item.kind === filter)
+  if (!trimmed) return sortItems(scoped)
+  return sortItems(
+    scoped.filter((item) => {
+      const haystack =
+        `${item.preview} ${item.kindLabel} ${item.kind} ${item.source}`.toLowerCase()
+      return haystack.includes(trimmed)
+    })
+  )
+}
+
+function historySections(
+  items: ClipboardHistoryItem[],
+  filter: ClipboardHistoryFilter,
+  locale: Locale,
+  rawInput: string
+): ListSection[] {
+  const favorites = items.filter((item) => item.favorite)
+  const regularItems = items.filter((item) => !item.favorite)
+  const sections: ListSection[] = []
+
+  if (favorites.length > 0) {
+    sections.push({
+      title: t(locale, "Favorites", "收藏"),
+      items: favorites.slice(0, DEFAULT_SEARCH_LIMIT).map((item) => toListItem(item, locale)),
+    })
+  }
+
+  if (filter === "all") {
+    for (const kind of ["text", "image", "file"] as const) {
+      const group = regularItems.filter((item) => item.kind === kind)
+      if (group.length > 0) {
+        sections.push({
+          title: groupTitle(kind, locale),
+          items: group.slice(0, DEFAULT_SEARCH_LIMIT).map((item) => toListItem(item, locale)),
+        })
+      }
+    }
+  } else if (regularItems.length > 0) {
+    sections.push({
+      title: t(locale, "History", "历史记录"),
+      items: regularItems.slice(0, DEFAULT_SEARCH_LIMIT).map((item) => toListItem(item, locale)),
+    })
+  }
+
+  if (sections.length === 0) {
+    sections.push({
+      title: t(locale, "History", "历史记录"),
+      items: [emptyItem(locale, rawInput)],
+    })
+  }
+
+  return sections
 }
 
 function toListItem(item: ClipboardHistoryItem, locale: Locale): ListItem {
   return {
     id: item.id,
     title: item.preview,
-    subtitle: t(locale, item.kindLabel, item.kindLabel),
-    accessory: formatRelativeAge(item.updatedAt, locale),
+    subtitle: `${item.kindLabel} · ${sourceLabel(item.source, locale)}`,
+    accessory: `${item.favorite ? "★ · " : ""}${formatRelativeAge(item.updatedAt, locale)}`,
     icon: iconForContent(item.content),
     actions: [
       {
         type: "custom",
         id: "copy-item",
         label: t(locale, "Copy", "复制"),
+        payload: { itemId: item.id },
+      },
+      {
+        type: "custom",
+        id: "toggle-favorite",
+        label: item.favorite ? t(locale, "Unstar", "取消收藏") : t(locale, "Star", "收藏"),
         payload: { itemId: item.id },
       },
     ],
@@ -243,20 +627,43 @@ function emptyItem(locale: Locale, query: string): ListItem {
     title: t(locale, "No matching clipboard items", "没有匹配的剪贴板内容"),
     subtitle: t(
       locale,
-      "Install and enable the plugin, then copy something to start collecting history.",
-      "安装并启用插件后，复制内容即可开始记录历史。"
+      "Copy text, images, or files to start collecting history.",
+      "复制文本、图片或文件后即可开始记录历史。"
     ),
     icon: "lucide:clipboard-list",
     actions: [],
   }
 }
 
-function controlItems(state: ClipboardHistoryState, locale: Locale): ListItem[] {
+function controlItems(
+  state: ClipboardHistoryState,
+  preferences: ClipboardHistoryPreferenceSet,
+  locale: Locale
+): ListItem[] {
+  const unstarredCount = state.items.filter((item) => !item.favorite).length
   return [
+    ...filterControlItems(state.filter, locale),
+    {
+      id: "control:sync",
+      title: t(locale, "WebDAV sync", "WebDAV 同步"),
+      subtitle: syncSubtitle(state.sync, preferences, locale),
+      icon: syncIcon(state.sync, preferences),
+      actions: [
+        {
+          type: "custom",
+          id: "sync-now",
+          label: t(locale, "Sync now", "立即同步"),
+        },
+      ],
+    },
     {
       id: "control:clear",
-      title: t(locale, "Clear history", "清空历史"),
-      subtitle: t(locale, `${state.items.length} item(s) stored`, `已保存 ${state.items.length} 项`),
+      title: t(locale, "Clear unstarred history", "清空未收藏历史"),
+      subtitle: t(
+        locale,
+        `${unstarredCount} unstarred item(s); favorites stay pinned`,
+        `${unstarredCount} 条未收藏记录；收藏项会保留置顶`
+      ),
       icon: "lucide:trash-2",
       actions: [
         {
@@ -269,6 +676,81 @@ function controlItems(state: ClipboardHistoryState, locale: Locale): ListItem[] 
   ]
 }
 
+function filterControlItems(filter: ClipboardHistoryFilter, locale: Locale): ListItem[] {
+  const options: Array<{
+    filter: ClipboardHistoryFilter
+    title: string
+    subtitle: string
+    icon: string
+  }> = [
+    {
+      filter: "all",
+      title: t(locale, "All types", "全部类型"),
+      subtitle: t(locale, "Show text, images, and files", "显示文本、图片和文件"),
+      icon: "lucide:list-filter",
+    },
+    {
+      filter: "text",
+      title: t(locale, "Text only", "仅文本"),
+      subtitle: t(locale, "Show text clipboard entries", "仅显示文本剪贴板记录"),
+      icon: "lucide:clipboard",
+    },
+    {
+      filter: "image",
+      title: t(locale, "Images only", "仅图片"),
+      subtitle: t(locale, "Show image clipboard entries", "仅显示图片剪贴板记录"),
+      icon: "lucide:image",
+    },
+    {
+      filter: "file",
+      title: t(locale, "Files only", "仅文件"),
+      subtitle: t(locale, "Show file clipboard entries", "仅显示文件剪贴板记录"),
+      icon: "lucide:files",
+    },
+  ]
+
+  return options.map((option) => ({
+    id: `filter:${option.filter}`,
+    title: option.title,
+    subtitle: option.subtitle,
+    accessory: option.filter === filter ? "✓" : undefined,
+    icon: option.icon,
+    actions: [
+      {
+        type: "custom",
+        id: "set-filter",
+        label: t(locale, "Select", "选择"),
+        payload: { filter: option.filter },
+      },
+    ],
+  }))
+}
+
+function syncSubtitle(
+  sync: ClipboardSyncState,
+  preferences: ClipboardHistoryPreferenceSet,
+  locale: Locale
+): string {
+  if (!preferences.webdavEnabled) return t(locale, "Disabled", "未启用")
+  if (!isWebDavSyncReady(preferences)) {
+    return t(locale, "Enabled, but URL or credentials are incomplete", "已启用，但 URL 或凭据不完整")
+  }
+  if (sync.lastError) return t(locale, `Last error: ${sync.lastError}`, `最近错误：${sync.lastError}`)
+  if (sync.lastSyncedAt) {
+    return t(
+      locale,
+      `Last synced ${formatRelativeAge(sync.lastSyncedAt, locale)}`,
+      `上次同步于${formatRelativeAge(sync.lastSyncedAt, locale)}`
+    )
+  }
+  return t(locale, "Ready to sync", "可以同步")
+}
+
+function syncIcon(sync: ClipboardSyncState, preferences: ClipboardHistoryPreferenceSet): string {
+  if (!preferences.webdavEnabled) return "lucide:cloud-off"
+  if (!isWebDavSyncReady(preferences) || sync.lastError) return "lucide:cloud-alert"
+  return "lucide:cloud-check"
+}
 
 function normalizeState(value: unknown): ClipboardHistoryState {
   if (!value || typeof value !== "object") return defaultState()
@@ -277,7 +759,8 @@ function normalizeState(value: unknown): ClipboardHistoryState {
     ? (record.items.map(normalizeItem).filter(Boolean) as ClipboardHistoryItem[])
     : []
   const sync = normalizeSync(record.sync)
-  return { items, sync }
+  const filter = normalizeFilter(record.filter)
+  return { items: sortItems(items), sync, filter }
 }
 
 function normalizeItem(value: unknown): ClipboardHistoryItem | null {
@@ -294,6 +777,9 @@ function normalizeItem(value: unknown): ClipboardHistoryItem | null {
     kind: content.type,
     kindLabel: typeof record.kindLabel === "string" ? record.kindLabel : kindLabel(content),
     updatedAt: record.updatedAt,
+    favorite: record.favorite === true,
+    favoriteUpdatedAt:
+      typeof record.favoriteUpdatedAt === "number" ? record.favoriteUpdatedAt : undefined,
     source: record.source === "sync" ? "sync" : "local",
   }
 }
@@ -306,6 +792,7 @@ function normalizeSync(value: unknown): ClipboardSyncState {
     enabled: record.enabled === true,
     cursor: typeof record.cursor === "string" ? record.cursor : undefined,
     lastSyncedAt: typeof record.lastSyncedAt === "number" ? record.lastSyncedAt : undefined,
+    lastError: typeof record.lastError === "string" ? record.lastError : undefined,
   }
 }
 
@@ -330,6 +817,10 @@ function normalizeClipboardContent(value: unknown): ClipboardContent | null {
   return null
 }
 
+function normalizeFilter(value: unknown): ClipboardHistoryFilter {
+  return value === "text" || value === "image" || value === "file" ? value : DEFAULT_FILTER
+}
+
 function defaultState(): ClipboardHistoryState {
   return {
     items: [],
@@ -337,7 +828,35 @@ function defaultState(): ClipboardHistoryState {
       provider: DEFAULT_SYNC_PROVIDER,
       enabled: false,
     },
+    filter: DEFAULT_FILTER,
   }
+}
+
+function isClipboardHistoryItem(item: ClipboardHistoryItem | null): item is ClipboardHistoryItem {
+  return item !== null
+}
+
+function asSyncedItem(item: ClipboardHistoryItem): ClipboardHistoryItem {
+  return { ...item, source: "sync" }
+}
+
+function limitStoredItems(
+  items: ClipboardHistoryItem[],
+  maxRegularItems: number
+): ClipboardHistoryItem[] {
+  const sorted = sortItems(items)
+  const favorites = sorted.filter((item) => item.favorite)
+  const regularItems = sorted.filter((item) => !item.favorite).slice(0, maxRegularItems)
+  return [...favorites, ...regularItems]
+}
+
+function sortItems(items: ClipboardHistoryItem[]): ClipboardHistoryItem[] {
+  return [...items].sort((left, right) => {
+    if (left.favorite !== right.favorite) return right.favorite ? 1 : -1
+    const leftSortAt = left.favorite ? left.favoriteUpdatedAt ?? left.updatedAt : left.updatedAt
+    const rightSortAt = right.favorite ? right.favoriteUpdatedAt ?? right.updatedAt : right.updatedAt
+    return rightSortAt - leftSortAt || right.updatedAt - left.updatedAt
+  })
 }
 
 function fingerprintContent(content: ClipboardContent): string {
@@ -374,6 +893,16 @@ function iconForContent(content: ClipboardContent): string {
   return "lucide:files"
 }
 
+function groupTitle(kind: ClipboardContent["type"], locale: Locale): string {
+  if (kind === "text") return t(locale, "Text", "文本")
+  if (kind === "image") return t(locale, "Images", "图片")
+  return t(locale, "Files", "文件")
+}
+
+function sourceLabel(source: ClipboardHistoryItem["source"], locale: Locale): string {
+  return source === "sync" ? t(locale, "Synced", "已同步") : t(locale, "Local", "本地")
+}
+
 function truncateWhitespace(value: string, maxLength: number): string {
   const normalized = value.replace(/\s+/g, " ").trim()
   if (normalized.length <= maxLength) return normalized
@@ -382,7 +911,7 @@ function truncateWhitespace(value: string, maxLength: number): string {
 
 function formatRelativeAge(timestamp: number, locale: Locale): string {
   const diff = Date.now() - timestamp
-  if (diff < 10_000) return t(locale, "Just now", "刚刚")
+  if (diff < 10_000) return t(locale, "just now", "刚刚")
   if (diff < 60_000) {
     const seconds = Math.floor(diff / 1000)
     return t(locale, `${seconds}s ago`, `${seconds} 秒前`)
@@ -399,6 +928,52 @@ function extractStringField(payload: unknown, key: string): string | undefined {
   if (!payload || typeof payload !== "object") return undefined
   const value = (payload as Record<string, unknown>)[key]
   return typeof value === "string" ? value : undefined
+}
+
+function base64Encode(value: string): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  const bytes = utf8Bytes(value)
+  let result = ""
+  for (let index = 0; index < bytes.length; index += 3) {
+    const first = bytes[index]
+    const second = bytes[index + 1]
+    const third = bytes[index + 2]
+    result += alphabet[first >> 2]
+    result += alphabet[((first & 3) << 4) | ((second ?? 0) >> 4)]
+    result += second === undefined ? "=" : alphabet[((second & 15) << 2) | ((third ?? 0) >> 6)]
+    result += third === undefined ? "=" : alphabet[third & 63]
+  }
+  return result
+}
+
+function utf8Bytes(value: string): number[] {
+  const bytes: number[] = []
+  for (const char of value) {
+    const codePoint = char.codePointAt(0) ?? 0
+    if (codePoint <= 0x7f) {
+      bytes.push(codePoint)
+    } else if (codePoint <= 0x7ff) {
+      bytes.push(0xc0 | (codePoint >> 6), 0x80 | (codePoint & 0x3f))
+    } else if (codePoint <= 0xffff) {
+      bytes.push(
+        0xe0 | (codePoint >> 12),
+        0x80 | ((codePoint >> 6) & 0x3f),
+        0x80 | (codePoint & 0x3f)
+      )
+    } else {
+      bytes.push(
+        0xf0 | (codePoint >> 18),
+        0x80 | ((codePoint >> 12) & 0x3f),
+        0x80 | ((codePoint >> 6) & 0x3f),
+        0x80 | (codePoint & 0x3f)
+      )
+    }
+  }
+  return bytes
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
 }
 
 function normalizeLocale(locale: string): Locale {

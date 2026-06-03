@@ -176,6 +176,23 @@ declare module "@deskit/plugin-sdk" {
   export interface NotificationAPI {
     show: (options: { title: string; body?: string; silent?: boolean }) => Promise<void>
   }
+  export interface NetworkRequestOptions {
+    method?: string
+    headers?: Record<string, string>
+    body?: string
+    timeoutMs?: number
+  }
+  export interface NetworkResponse {
+    url: string
+    status: number
+    statusText: string
+    ok: boolean
+    headers: Record<string, string>
+    body: string
+  }
+  export interface NetworkAPI {
+    request: (url: string, options?: NetworkRequestOptions) => Promise<NetworkResponse>
+  }
   export interface SystemAPI {
     openUrl: (url: string) => Promise<void>
     openPath: (path: string) => Promise<void>
@@ -188,6 +205,7 @@ declare module "@deskit/plugin-sdk" {
     preferences: Record<string, unknown>
     storage: StorageAPI
     clipboard: ClipboardAPI
+    network: NetworkAPI
     notifications: NotificationAPI
     system: SystemAPI
     log: (...args: unknown[]) => void

@@ -95,12 +95,58 @@
           "zh-CN": "记录文件剪贴板"
         },
         "default": true
+      },
+      {
+        "id": "webdavEnabled",
+        "type": "checkbox",
+        "label": {
+          "en": "Enable WebDAV sync",
+          "zh-CN": "启用 WebDAV 同步"
+        },
+        "default": false
+      },
+      {
+        "id": "webdavUrl",
+        "type": "text",
+        "label": {
+          "en": "WebDAV root URL",
+          "zh-CN": "WebDAV 根 URL"
+        },
+        "default": ""
+      },
+      {
+        "id": "webdavUsername",
+        "type": "text",
+        "label": {
+          "en": "WebDAV username",
+          "zh-CN": "WebDAV 用户名"
+        },
+        "default": ""
+      },
+      {
+        "id": "webdavPassword",
+        "type": "text",
+        "label": {
+          "en": "WebDAV password or app token",
+          "zh-CN": "WebDAV 密码或应用令牌"
+        },
+        "default": ""
+      },
+      {
+        "id": "webdavPath",
+        "type": "text",
+        "label": {
+          "en": "WebDAV sync file path",
+          "zh-CN": "WebDAV 同步文件路径"
+        },
+        "default": "deskit/clipboard-history.json"
       }
     ]
   },
   "permissions": [
     "clipboard:read",
     "clipboard:write",
-    "storage:plugin"
+    "storage:plugin",
+    "network:http"
   ]
 }
