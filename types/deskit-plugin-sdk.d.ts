@@ -22,14 +22,7 @@ declare module "@deskit/plugin-sdk" {
     height?: number
     name?: string
   }
-  export interface ClipboardFileContent {
-    type: "file"
-    paths: string[]
-  }
-  export type ClipboardContent =
-    | ClipboardTextContent
-    | ClipboardImageContent
-    | ClipboardFileContent
+  export type ClipboardContent = ClipboardTextContent | ClipboardImageContent
   export type ClipboardActionValue = string | ClipboardContent
 
   export interface CopyAction {
@@ -193,6 +186,19 @@ declare module "@deskit/plugin-sdk" {
   export interface NetworkAPI {
     request: (url: string, options?: NetworkRequestOptions) => Promise<NetworkResponse>
   }
+  export interface PluginSyncStatus {
+    enabled: boolean
+    available: boolean
+    lastSyncedAt?: string
+    lastRemoteUpdatedAt?: string
+    lastLocalUpdatedAt?: string
+  }
+  export interface PluginSyncAPI {
+    status: () => Promise<PluginSyncStatus>
+    get: <T = unknown>(key: string) => Promise<T | undefined>
+    set: <T = unknown>(key: string, value: T) => Promise<void>
+    delete: (key: string) => Promise<void>
+  }
   export interface SystemAPI {
     openUrl: (url: string) => Promise<void>
     openPath: (path: string) => Promise<void>
@@ -206,6 +212,7 @@ declare module "@deskit/plugin-sdk" {
     storage: StorageAPI
     clipboard: ClipboardAPI
     network: NetworkAPI
+    sync: PluginSyncAPI
     notifications: NotificationAPI
     system: SystemAPI
     log: (...args: unknown[]) => void
