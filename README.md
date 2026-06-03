@@ -45,7 +45,7 @@ npm run check
 npm run pack
 ```
 
-The package command emits `release/com.deskit.clipboard-history-0.3.1.deskit` and a `.sha256` file.
+The package command emits `release/com.deskit.clipboard-history-0.3.2.deskit` and a `.sha256` file.
 
 ## Manifest
 
