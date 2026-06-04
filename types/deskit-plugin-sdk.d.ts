@@ -100,6 +100,8 @@ declare module "@deskit/plugin-sdk" {
     title: LocalizedString
     subtitle?: LocalizedString
     accessory?: string
+    accessoryIcon?: string
+    accessoryIconActive?: boolean
     icon?: string
     actions: Action[]
   }

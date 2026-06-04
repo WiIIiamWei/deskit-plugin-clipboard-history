@@ -768,7 +768,9 @@ function toListItem(item: ClipboardHistoryItem, locale: Locale): ListItem {
     id: item.id,
     title: item.preview,
     subtitle: `${item.kindLabel} · ${sourceLabel(item.source, locale)}`,
-    accessory: `${item.favorite ? "★ · " : ""}${formatRelativeAge(item.updatedAt, locale)}`,
+    accessory: formatRelativeAge(item.updatedAt, locale),
+    accessoryIcon: item.favorite ? "lucide:star" : undefined,
+    accessoryIconActive: item.favorite,
     icon: iconForContent(item.content),
     actions: [
       {
@@ -876,7 +878,8 @@ function filterControlItems(filter: ClipboardHistoryFilter, locale: Locale): Lis
     id: `filter:${option.filter}`,
     title: option.title,
     subtitle: option.subtitle,
-    accessory: option.filter === filter ? "✓" : undefined,
+    accessoryIcon: option.filter === filter ? "lucide:check" : undefined,
+    accessoryIconActive: option.filter === filter,
     icon: option.icon,
     actions: [
       {
