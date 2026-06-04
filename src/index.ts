@@ -769,8 +769,6 @@ function toListItem(item: ClipboardHistoryItem, locale: Locale): ListItem {
     title: item.preview,
     subtitle: `${item.kindLabel} · ${sourceLabel(item.source, locale)}`,
     accessory: formatRelativeAge(item.updatedAt, locale),
-    accessoryIcon: item.favorite ? "lucide:star" : undefined,
-    accessoryIconActive: item.favorite,
     icon: iconForContent(item.content),
     actions: [
       {
