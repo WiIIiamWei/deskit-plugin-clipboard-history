@@ -10,7 +10,7 @@
     "en": "Collect recent clipboard items and copy them back from the launcher.",
     "zh-CN": "记录最近的剪贴板内容，并可从启动器快速复制。"
   },
-  "version": "0.4.2",
+  "version": "0.4.3",
   "author": "DesKit",
   "icon": "lucide:clipboard-list",
   "engines": {
