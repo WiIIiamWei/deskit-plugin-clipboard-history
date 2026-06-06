@@ -429,14 +429,17 @@ function jsonByteLength(value: unknown): number {
 }
 
 function historyItemToSyncItem(item: ClipboardHistoryItem): ClipboardTextSyncItem {
-  return {
+  const next: ClipboardTextSyncItem = {
     id: item.id,
     text: item.content.type === "text" ? item.content.text : "",
     preview: item.preview,
     updatedAt: item.updatedAt,
     favorite: item.favorite,
-    favoriteUpdatedAt: item.favoriteUpdatedAt,
   }
+  if (typeof item.favoriteUpdatedAt === "number") {
+    next.favoriteUpdatedAt = item.favoriteUpdatedAt
+  }
+  return next
 }
 
 function syncDocumentToHistoryItems(value: unknown): ClipboardHistoryItem[] {
