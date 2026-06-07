@@ -7,6 +7,9 @@ import type {
   ToastOnly,
 } from "@deskit/plugin-sdk"
 
+declare function setInterval(handler: () => void, timeout: number): unknown
+declare function clearInterval(handle: unknown): void
+
 const COMMAND_ID = "clipboard-history.open"
 const HISTORY_STORAGE_KEY = "clipboard-history.state"
 const DEFAULT_MAX_ITEMS = 50
@@ -23,8 +26,17 @@ const MAX_PREVIEW_LENGTH = 140
 const SELF_WRITE_IGNORE_MS = 3_000
 const MAX_SYNC_ITEMS = 5
 const MAX_SYNC_BYTES = 512 * 1024
+const MAX_TEXT_BYTES = 512 * 1024
+const MAX_CLIPBOARD_ITEM_BYTES = 4 * 1024 * 1024
+const MAX_IMAGE_CACHE_BYTES = 128 * 1024 * 1024
+const IMAGE_CACHE_CLEANUP_INTERVAL_MS = 10 * 60 * 1000
+const IMAGE_BLOB_PREFIX = "clipboard-images"
 
 let captureQueue: Promise<void> = Promise.resolve()
+let captureInFlight = false
+let pendingCapture: { content: ClipboardContent; ctx: PluginContext } | undefined
+let maintenanceTimer: unknown | undefined
+let maintenanceQueue: Promise<void> = Promise.resolve()
 let syncQueue: Promise<void> = Promise.resolve()
 const ignoredClipboardFingerprints = new Map<string, number>()
 
@@ -35,11 +47,28 @@ interface ClipboardChangeEvent {
 type ClipboardHistoryFilter = "all" | ClipboardContent["type"]
 type SyncProvider = "off" | "gist" | "webdav"
 
+interface ClipboardTextStoredContent {
+  type: "text"
+  text: string
+}
+
+interface ClipboardImageStoredContent {
+  type: "image"
+  blobKey: string
+  mimeType: string
+  byteLength: number
+  width?: number
+  height?: number
+  name?: string
+}
+
+type ClipboardStoredContent = ClipboardTextStoredContent | ClipboardImageStoredContent
+
 interface ClipboardHistoryItem {
   id: string
-  content: ClipboardContent
+  content: ClipboardStoredContent
   preview: string
-  kind: ClipboardContent["type"]
+  kind: ClipboardStoredContent["type"]
   kindLabel: string
   updatedAt: number
   favorite: boolean
@@ -94,6 +123,15 @@ interface WebDavResponse {
   body: string
 }
 
+interface StateReadResult {
+  state: ClipboardHistoryState
+  migrated: boolean
+}
+
+interface NormalizationState {
+  migrated: boolean
+}
+
 type ListSection = { title?: string; items: ListItem[] }
 
 const plugin: PluginModule = {
@@ -113,23 +151,57 @@ const plugin: PluginModule = {
         if (actionId === "clear-history") return handleClearHistory(ctx)
         return undefined
       },
+      async dispose(ctx) {
+        if (maintenanceTimer) {
+          clearInterval(maintenanceTimer)
+          maintenanceTimer = undefined
+        }
+        await captureQueue
+        await maintenanceQueue
+        const state = await readState(ctx)
+        state.items = await cleanupImageBlobs(ctx, state.items)
+        await writeState(ctx, state)
+      },
     },
   },
   events: {
-    async onClipboardChange(event: ClipboardChangeEvent, ctx: PluginContext) {
-      captureQueue = captureQueue
-        .then(() => captureClipboardContent(event.content, ctx))
-        .catch((err) => ctx.log("failed to capture clipboard history", err))
-      await captureQueue
+    onClipboardChange(event: ClipboardChangeEvent, ctx: PluginContext) {
+      queueClipboardCapture(event.content, ctx)
     },
   },
+}
+
+function queueClipboardCapture(content: ClipboardContent, ctx: PluginContext): void {
+  ensureMaintenance(ctx)
+  pendingCapture = { content, ctx }
+  if (captureInFlight) return
+
+  captureInFlight = true
+  captureQueue = (async () => {
+    try {
+      while (pendingCapture) {
+        const next = pendingCapture
+        pendingCapture = undefined
+        try {
+          await captureClipboardContent(next.content, next.ctx)
+        } catch (err) {
+          next.ctx.log("failed to capture clipboard history", err)
+        }
+      }
+    } finally {
+      captureInFlight = false
+      if (pendingCapture) queueClipboardCapture(pendingCapture.content, pendingCapture.ctx)
+    }
+  })()
 }
 
 async function captureClipboardContent(content: ClipboardContent, ctx: PluginContext): Promise<void> {
   const preferences = readPreferences(ctx)
   if (!shouldCapture(content, preferences)) return
+  const prepared = await prepareStoredContent(content, ctx)
+  if (!prepared) return
 
-  const fingerprint = fingerprintContent(content)
+  const fingerprint = fingerprintStoredContent(prepared.content)
   if (shouldIgnoreClipboardFingerprint(fingerprint)) return
 
   const state = await readState(ctx)
@@ -137,28 +209,34 @@ async function captureClipboardContent(content: ClipboardContent, ctx: PluginCon
   const now = Date.now()
   const nextItem: ClipboardHistoryItem = {
     id: fingerprint,
-    content,
-    preview: previewContent(content),
-    kind: content.type,
-    kindLabel: kindLabel(content),
+    content: prepared.content,
+    preview: prepared.preview,
+    kind: prepared.content.type,
+    kindLabel: kindLabel(prepared.content),
     updatedAt: now,
     favorite: existing?.favorite ?? false,
     favoriteUpdatedAt: existing?.favoriteUpdatedAt,
     source: "local",
   }
 
-  state.items = limitStoredItems(
+  const previousItems = state.items
+  state.items = await limitStoredItems(
     [nextItem, ...state.items.filter((item) => item.id !== fingerprint)],
-    preferences.maxItems
+    preferences.maxItems,
+    ctx
   )
+  await writeState(ctx, state)
+  state.items = await cleanupUnreferencedImageBlobs(ctx, state.items, previousItems)
   await writeState(ctx, state)
   queueSync(ctx)
 }
 
 async function makeView(rawInput: string, ctx: PluginContext): Promise<ListView> {
+  ensureMaintenance(ctx)
   const locale = normalizeLocale(ctx.locale)
   const preferences = readPreferences(ctx)
-  const state = await readState(ctx)
+  const { state, migrated } = await readStateWithMigration(ctx)
+  if (migrated) await writeState(ctx, state)
   const filtered = filterItems(state.items, rawInput, state.filter)
   const sections = historySections(filtered, state.filter, locale, rawInput)
 
@@ -176,6 +254,28 @@ async function makeView(rawInput: string, ctx: PluginContext): Promise<ListView>
   }
 }
 
+function ensureMaintenance(ctx: PluginContext): void {
+  if (maintenanceTimer) return
+  maintenanceTimer = setInterval(
+    () => queueImageCacheMaintenance(ctx),
+    IMAGE_CACHE_CLEANUP_INTERVAL_MS
+  )
+}
+
+function queueImageCacheMaintenance(ctx: PluginContext): void {
+  maintenanceQueue = maintenanceQueue
+    .then(async () => {
+      await captureQueue
+      const { state, migrated } = await readStateWithMigration(ctx)
+      const items = await cleanupImageBlobs(ctx, state.items)
+      if (migrated || !sameHistoryItems(items, state.items)) {
+        state.items = items
+        await writeState(ctx, state)
+      }
+    })
+    .catch((err) => ctx.log("failed to clean clipboard image cache", err))
+}
+
 async function handleCopyItem(payload: unknown, ctx: PluginContext): Promise<ToastOnly | ListView> {
   const itemId = extractStringField(payload, "itemId")
   if (!itemId) return makeView("", ctx)
@@ -184,10 +284,27 @@ async function handleCopyItem(payload: unknown, ctx: PluginContext): Promise<Toa
   const item = state.items.find((candidate) => candidate.id === itemId)
   if (!item) return makeView("", ctx)
 
-  const fingerprint = fingerprintContent(item.content)
+  const content = await itemToClipboardContent(item, ctx)
+  if (!content) {
+    state.items = state.items.filter((candidate) => candidate.id !== item.id)
+    await writeState(ctx, state)
+    state.items = await cleanupImageBlobs(ctx, state.items)
+    await writeState(ctx, state)
+    return {
+      type: "toast",
+      level: "warning",
+      message: t(
+        normalizeLocale(ctx.locale),
+        "Clipboard image is no longer available",
+        "剪贴板图片缓存已不存在"
+      ),
+    }
+  }
+
+  const fingerprint = fingerprintStoredContent(item.content)
   markSelfWrittenClipboardFingerprint(fingerprint)
   try {
-    await ctx.clipboard.write(item.content)
+    await ctx.clipboard.write(content)
   } catch (err) {
     ignoredClipboardFingerprints.delete(fingerprint)
     throw err
@@ -208,7 +325,9 @@ async function handleToggleFavorite(payload: unknown, ctx: PluginContext): Promi
 
   item.favorite = !item.favorite
   item.favoriteUpdatedAt = Date.now()
-  state.items = limitStoredItems(state.items, readPreferences(ctx).maxItems)
+  state.items = await limitStoredItems(state.items, readPreferences(ctx).maxItems, ctx)
+  await writeState(ctx, state)
+  state.items = await cleanupImageBlobs(ctx, state.items)
   await writeState(ctx, state)
   queueSync(ctx)
   return makeView("", ctx)
@@ -271,6 +390,9 @@ async function handleClearHistory(ctx: PluginContext): Promise<ToastOnly> {
   const favoriteItems = state.items.filter((item) => item.favorite)
   const removedCount = state.items.length - favoriteItems.length
   state.items = favoriteItems
+  state.items = await limitStoredItems(state.items, readPreferences(ctx).maxItems, ctx)
+  await writeState(ctx, state)
+  state.items = await cleanupImageBlobs(ctx, state.items)
   await writeState(ctx, state)
   queueSync(ctx)
   return {
@@ -285,11 +407,23 @@ async function handleClearHistory(ctx: PluginContext): Promise<ToastOnly> {
 }
 
 async function readState(ctx: PluginContext): Promise<ClipboardHistoryState> {
-  return normalizeState(await ctx.storage.get(HISTORY_STORAGE_KEY))
+  return (await readStateWithMigration(ctx)).state
+}
+
+async function readStateWithMigration(ctx: PluginContext): Promise<StateReadResult> {
+  const raw = await ctx.storage.get(HISTORY_STORAGE_KEY)
+  const migration: NormalizationState = { migrated: false }
+  const state = await normalizeState(raw, ctx, migration)
+  const limitedItems = await limitStoredItems(state.items, readPreferences(ctx).maxItems, ctx)
+  if (!sameHistoryItems(limitedItems, state.items)) {
+    state.items = limitedItems
+    migration.migrated = true
+  }
+  return { state, migrated: migration.migrated }
 }
 
 async function writeState(ctx: PluginContext, state: ClipboardHistoryState): Promise<void> {
-  await ctx.storage.set(HISTORY_STORAGE_KEY, normalizeState(state))
+  await ctx.storage.set(HISTORY_STORAGE_KEY, await normalizeState(state, ctx, { migrated: false }))
 }
 
 function queueSync(ctx: PluginContext): void {
@@ -313,9 +447,10 @@ async function syncState(ctx: PluginContext): Promise<ClipboardHistoryState> {
     const now = Date.now()
     const nextState: ClipboardHistoryState = {
       ...current,
-      items: limitStoredItems(
+      items: await limitStoredItems(
         mergeClipboardItems(current.items, remoteItems),
-        preferences.maxItems
+        preferences.maxItems,
+        ctx
       ),
       sync: {
         provider: preferences.syncProvider,
@@ -323,6 +458,8 @@ async function syncState(ctx: PluginContext): Promise<ClipboardHistoryState> {
         lastSyncedAt: now,
       },
     }
+    await writeState(ctx, nextState)
+    nextState.items = await cleanupImageBlobs(ctx, nextState.items)
     await writeState(ctx, nextState)
     await writeRemoteSyncItems(ctx, preferences, nextState.items, now)
     return nextState
@@ -463,16 +600,20 @@ function normalizeSyncItem(value: unknown): ClipboardHistoryItem | null {
         ? oldContent.text
         : undefined
   if (typeof text !== "string" || typeof record.updatedAt !== "number") return null
-  const content: ClipboardContent = { type: "text", text }
+  const content: ClipboardTextStoredContent = {
+    type: "text",
+    text: truncateUtf8(text, MAX_TEXT_BYTES),
+  }
   const id =
-    typeof record.id === "string" && record.id ? record.id : fingerprintContent(content)
+    typeof record.id === "string" && record.id ? record.id : fingerprintStoredContent(content)
+  const preview =
+    typeof record.preview === "string" && record.preview
+      ? truncateWhitespace(record.preview, MAX_PREVIEW_LENGTH)
+      : previewContent(content)
   return {
     id,
     content,
-    preview:
-      typeof record.preview === "string" && record.preview
-        ? record.preview
-        : previewContent(content),
+    preview,
     kind: "text",
     kindLabel: "Text",
     updatedAt: record.updatedAt,
@@ -702,6 +843,8 @@ function shouldCapture(
   preferences: ClipboardHistoryPreferenceSet
 ): boolean {
   if (content.type === "text") return content.text.trim().length > 0
+  const decoded = splitDataUrl(content.dataUrl)
+  if (!decoded || decoded.byteLength > MAX_CLIPBOARD_ITEM_BYTES) return false
   return preferences.captureImages
 }
 
@@ -931,28 +1074,97 @@ function syncIcon(sync: ClipboardSyncState, preferences: ClipboardHistoryPrefere
   return "lucide:cloud-check"
 }
 
-function normalizeState(value: unknown): ClipboardHistoryState {
+async function prepareStoredContent(
+  content: ClipboardContent,
+  ctx: PluginContext
+): Promise<{ content: ClipboardStoredContent; preview: string } | null> {
+  if (content.type === "text") {
+    const text = truncateUtf8(content.text, MAX_TEXT_BYTES)
+    if (!text.trim()) return null
+    const storedContent: ClipboardTextStoredContent = { type: "text", text }
+    return { content: storedContent, preview: previewContent(storedContent) }
+  }
+
+  const decoded = splitDataUrl(content.dataUrl)
+  if (!decoded) return null
+  if (decoded.byteLength > MAX_CLIPBOARD_ITEM_BYTES) return null
+  const mimeType = content.mimeType || decoded.mimeType
+  const blobKey = imageBlobKey(content.dataUrl, mimeType)
+  await ctx.storage.writeBlob(blobKey, decoded.base64, { encoding: "base64" })
+  const storedContent: ClipboardImageStoredContent = {
+    type: "image",
+    blobKey,
+    mimeType,
+    byteLength: decoded.byteLength,
+    width: content.width,
+    height: content.height,
+    name: content.name,
+  }
+  return { content: storedContent, preview: previewContent(storedContent) }
+}
+
+async function itemToClipboardContent(
+  item: ClipboardHistoryItem,
+  ctx: PluginContext
+): Promise<ClipboardContent | null> {
+  if (item.content.type === "text") return { type: "text", text: item.content.text }
+  const base64 = await ctx.storage.readBlob(item.content.blobKey, { encoding: "base64" })
+  if (!base64) return null
+  return {
+    type: "image",
+    dataUrl: `data:${item.content.mimeType};base64,${base64}`,
+    mimeType: item.content.mimeType,
+    width: item.content.width,
+    height: item.content.height,
+    name: item.content.name,
+  }
+}
+
+async function normalizeState(
+  value: unknown,
+  ctx: PluginContext,
+  migration: NormalizationState
+): Promise<ClipboardHistoryState> {
   if (!value || typeof value !== "object") return defaultState()
   const record = value as Record<string, unknown>
-  const items = Array.isArray(record.items)
-    ? (record.items.map(normalizeItem).filter(Boolean) as ClipboardHistoryItem[])
-    : []
+  const items: ClipboardHistoryItem[] = []
+  if (Array.isArray(record.items)) {
+    for (const item of record.items) {
+      const normalized = await normalizeItem(item, ctx, migration)
+      if (normalized) {
+        items.push(normalized)
+      } else {
+        migration.migrated = true
+      }
+    }
+  }
   const sync = normalizeSync(record.sync)
   const filter = normalizeFilter(record.filter)
   return { items: sortItems(items), sync, filter }
 }
 
-function normalizeItem(value: unknown): ClipboardHistoryItem | null {
+async function normalizeItem(
+  value: unknown,
+  ctx: PluginContext,
+  migration: NormalizationState
+): Promise<ClipboardHistoryItem | null> {
   if (!value || typeof value !== "object") return null
   const record = value as Record<string, unknown>
-  const content = normalizeClipboardContent(record.content)
+  const content = await normalizeStoredContent(record.content, ctx, migration)
   if (!content) return null
-  if (typeof record.id !== "string" || typeof record.preview !== "string") return null
+  if (typeof record.id !== "string") return null
   if (typeof record.updatedAt !== "number") return null
+  const originalPreview = typeof record.preview === "string" ? record.preview : undefined
+  const preview =
+    originalPreview !== undefined
+      ? truncateWhitespace(originalPreview, MAX_PREVIEW_LENGTH)
+      : previewContent(content)
+  const nextPreview = content.type === "text" ? previewContent(content) : preview
+  if (nextPreview !== originalPreview) migration.migrated = true
   return {
     id: record.id,
     content,
-    preview: record.preview,
+    preview: nextPreview,
     kind: content.type,
     kindLabel: typeof record.kindLabel === "string" ? record.kindLabel : kindLabel(content),
     updatedAt: record.updatedAt,
@@ -975,11 +1187,65 @@ function normalizeSync(value: unknown): ClipboardSyncState {
   }
 }
 
+async function normalizeStoredContent(
+  value: unknown,
+  ctx: PluginContext,
+  migration: NormalizationState
+): Promise<ClipboardStoredContent | null> {
+  if (!value || typeof value !== "object") return null
+  const record = value as Record<string, unknown>
+  if (record.type === "text" && typeof record.text === "string") {
+    const text = truncateUtf8(record.text, MAX_TEXT_BYTES)
+    if (text !== record.text) migration.migrated = true
+    return text.trim() ? { type: "text", text } : null
+  }
+  if (
+    record.type === "image" &&
+    typeof record.blobKey === "string" &&
+    typeof record.mimeType === "string"
+  ) {
+    const byteLength = typeof record.byteLength === "number" ? record.byteLength : 0
+    if (byteLength > MAX_CLIPBOARD_ITEM_BYTES) {
+      migration.migrated = true
+      return null
+    }
+    return {
+      type: "image",
+      blobKey: record.blobKey,
+      mimeType: record.mimeType,
+      byteLength,
+      width: typeof record.width === "number" ? record.width : undefined,
+      height: typeof record.height === "number" ? record.height : undefined,
+      name: typeof record.name === "string" ? record.name : undefined,
+    }
+  }
+  if (
+    record.type === "image" &&
+    typeof record.dataUrl === "string" &&
+    typeof record.mimeType === "string"
+  ) {
+    const prepared = await prepareStoredContent(
+      {
+        type: "image",
+        dataUrl: record.dataUrl,
+        mimeType: record.mimeType,
+        width: typeof record.width === "number" ? record.width : undefined,
+        height: typeof record.height === "number" ? record.height : undefined,
+        name: typeof record.name === "string" ? record.name : undefined,
+      },
+      ctx
+    )
+    migration.migrated = true
+    return prepared?.content ?? null
+  }
+  return null
+}
+
 function normalizeClipboardContent(value: unknown): ClipboardContent | null {
   if (!value || typeof value !== "object") return null
   const record = value as Record<string, unknown>
   if (record.type === "text" && typeof record.text === "string") {
-    return { type: "text", text: record.text }
+    return { type: "text", text: truncateUtf8(record.text, MAX_TEXT_BYTES) }
   }
   if (
     record.type === "image" &&
@@ -1017,14 +1283,124 @@ function isClipboardHistoryItem(item: ClipboardHistoryItem | null): item is Clip
   return item !== null
 }
 
-function limitStoredItems(
+function sameHistoryItems(left: ClipboardHistoryItem[], right: ClipboardHistoryItem[]): boolean {
+  if (left.length !== right.length) return false
+  return left.every((item, index) => {
+    const other = right[index]
+    if (!other || item.id !== other.id || item.kind !== other.kind) return false
+    if (item.content.type !== other.content.type) return false
+    if (item.content.type === "text" && other.content.type === "text") {
+      return item.content.text === other.content.text
+    }
+    if (item.content.type === "image" && other.content.type === "image") {
+      return (
+        item.content.blobKey === other.content.blobKey &&
+        item.content.byteLength === other.content.byteLength
+      )
+    }
+    return false
+  })
+}
+
+async function limitStoredItems(
   items: ClipboardHistoryItem[],
-  maxRegularItems: number
-): ClipboardHistoryItem[] {
+  maxRegularItems: number,
+  ctx: PluginContext
+): Promise<ClipboardHistoryItem[]> {
   const sorted = sortItems(items)
   const favorites = sorted.filter((item) => item.favorite)
   const regularItems = sorted.filter((item) => !item.favorite).slice(0, maxRegularItems)
-  return [...favorites, ...regularItems]
+  return limitImageCacheItems([...favorites, ...regularItems], await ctx.storage.listBlobs())
+}
+
+function limitImageCacheItems(
+  items: ClipboardHistoryItem[],
+  blobs: Array<{ key: string; size: number; updatedAt: number }>
+): ClipboardHistoryItem[] {
+  const blobSizes = new Map(blobs.map((blob) => [blob.key, blob.size]))
+  const selected: ClipboardHistoryItem[] = []
+  let imageBytes = 0
+
+  for (const item of sortItems(items)) {
+    if (item.content.type !== "image") {
+      selected.push(item)
+      continue
+    }
+    const size = blobSizes.get(item.content.blobKey)
+    if (size === undefined) continue
+    if (size > MAX_CLIPBOARD_ITEM_BYTES) continue
+    if (imageBytes + size > MAX_IMAGE_CACHE_BYTES) continue
+    selected.push({ ...item, content: { ...item.content, byteLength: size } })
+    imageBytes += size
+  }
+
+  return sortItems(selected)
+}
+
+async function cleanupUnreferencedImageBlobs(
+  ctx: PluginContext,
+  nextItems: ClipboardHistoryItem[],
+  previousItems: ClipboardHistoryItem[]
+): Promise<ClipboardHistoryItem[]> {
+  const nextKeys = imageBlobKeys(nextItems)
+  await Promise.all(
+    [...imageBlobKeys(previousItems)]
+      .filter((key) => !nextKeys.has(key))
+      .map((key) => ctx.storage.deleteBlob(key))
+  )
+  return cleanupImageBlobs(ctx, nextItems)
+}
+
+async function cleanupImageBlobs(
+  ctx: PluginContext,
+  items: ClipboardHistoryItem[]
+): Promise<ClipboardHistoryItem[]> {
+  const keepKeys = imageBlobKeys(items)
+  const blobs = await ctx.storage.listBlobs()
+  const imageBlobs = blobs
+    .filter((blob) => blob.key.startsWith(`${IMAGE_BLOB_PREFIX}/`))
+    .sort((left, right) => {
+      const leftItem = imageItemForBlob(items, left.key)
+      const rightItem = imageItemForBlob(items, right.key)
+      if (leftItem?.favorite !== rightItem?.favorite) return leftItem?.favorite ? 1 : -1
+      return (leftItem?.updatedAt ?? left.updatedAt) - (rightItem?.updatedAt ?? right.updatedAt)
+    })
+
+  let total = 0
+  const deleteKeys = new Set<string>()
+  for (const blob of imageBlobs) {
+    if (!keepKeys.has(blob.key)) {
+      deleteKeys.add(blob.key)
+      continue
+    }
+    total += blob.size
+  }
+
+  for (const blob of imageBlobs) {
+    if (total <= MAX_IMAGE_CACHE_BYTES) break
+    if (deleteKeys.has(blob.key)) continue
+    deleteKeys.add(blob.key)
+    total -= blob.size
+  }
+
+  await Promise.all([...deleteKeys].map((key) => ctx.storage.deleteBlob(key)))
+  if (deleteKeys.size === 0) return items
+  return items.filter(
+    (item) => item.content.type !== "image" || !deleteKeys.has(item.content.blobKey)
+  )
+}
+
+function imageBlobKeys(items: ClipboardHistoryItem[]): Set<string> {
+  return new Set(
+    items.flatMap((item) => (item.content.type === "image" ? [item.content.blobKey] : []))
+  )
+}
+
+function imageItemForBlob(
+  items: ClipboardHistoryItem[],
+  key: string
+): ClipboardHistoryItem | undefined {
+  return items.find((item) => item.content.type === "image" && item.content.blobKey === key)
 }
 
 function sortItems(items: ClipboardHistoryItem[]): ClipboardHistoryItem[] {
@@ -1036,8 +1412,9 @@ function sortItems(items: ClipboardHistoryItem[]): ClipboardHistoryItem[] {
   })
 }
 
-function fingerprintContent(content: ClipboardContent): string {
-  return `clip:${hashString(JSON.stringify(content))}`
+function fingerprintStoredContent(content: ClipboardStoredContent): string {
+  if (content.type === "text") return `clip:${hashString(content.text)}`
+  return `clip:${hashString(content.blobKey)}`
 }
 
 function hashString(value: string): string {
@@ -1049,22 +1426,47 @@ function hashString(value: string): string {
   return (hash >>> 0).toString(36)
 }
 
-function previewContent(content: ClipboardContent): string {
+function previewContent(content: ClipboardStoredContent): string {
   if (content.type === "text") return truncateWhitespace(content.text, MAX_PREVIEW_LENGTH)
   const size = content.width && content.height ? ` · ${content.width}×${content.height}` : ""
   return content.name ? `${content.name}${size}` : `Image${size}`
 }
 
-function kindLabel(content: ClipboardContent): string {
+function kindLabel(content: ClipboardStoredContent): string {
   return content.type === "text" ? "Text" : content.mimeType || "Image"
 }
 
-function iconForContent(content: ClipboardContent): string {
+function iconForContent(content: ClipboardStoredContent): string {
   return content.type === "text" ? "lucide:clipboard" : "lucide:image"
 }
 
-function groupTitle(kind: ClipboardContent["type"], locale: Locale): string {
+function groupTitle(kind: ClipboardStoredContent["type"], locale: Locale): string {
   return kind === "text" ? t(locale, "Text", "文本") : t(locale, "Images", "图片")
+}
+
+function splitDataUrl(
+  dataUrl: string
+): { mimeType: string; base64: string; byteLength: number } | null {
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl)
+  if (!match) return null
+  const base64 = match[2]
+  return { mimeType: match[1], base64, byteLength: base64ByteLength(base64) }
+}
+
+function imageBlobKey(dataUrl: string, mimeType: string): string {
+  const extension = imageExtension(mimeType)
+  return `${IMAGE_BLOB_PREFIX}/${hashString(dataUrl)}.${extension}`
+}
+
+function imageExtension(mimeType: string): string {
+  if (mimeType === "image/jpeg") return "jpg"
+  if (mimeType === "image/webp") return "webp"
+  return "png"
+}
+
+function base64ByteLength(value: string): number {
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0
+  return Math.max(0, Math.floor((value.length * 3) / 4) - padding)
 }
 
 function sourceLabel(source: ClipboardHistoryItem["source"], locale: Locale): string {
@@ -1075,6 +1477,18 @@ function truncateWhitespace(value: string, maxLength: number): string {
   const normalized = value.replace(/\s+/g, " ").trim()
   if (normalized.length <= maxLength) return normalized
   return `${normalized.slice(0, maxLength - 1)}…`
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  let bytes = 0
+  let end = 0
+  for (const char of value) {
+    const charBytes = utf8Bytes(char).length
+    if (bytes + charBytes > maxBytes) break
+    bytes += charBytes
+    end += char.length
+  }
+  return value.slice(0, end)
 }
 
 function formatRelativeAge(timestamp: number, locale: Locale): string {

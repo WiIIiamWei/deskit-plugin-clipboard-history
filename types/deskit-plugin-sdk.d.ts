@@ -176,6 +176,17 @@ declare module "@deskit/plugin-sdk" {
     set: <T = unknown>(key: string, value: T) => Promise<void>
     delete: (key: string) => Promise<void>
     list: () => Promise<string[]>
+    writeBlob: (
+      key: string,
+      data: string,
+      options?: { encoding?: "utf8" | "base64" }
+    ) => Promise<{ key: string; size: number; updatedAt: number }>
+    readBlob: (
+      key: string,
+      options?: { encoding?: "utf8" | "base64" }
+    ) => Promise<string | undefined>
+    deleteBlob: (key: string) => Promise<void>
+    listBlobs: () => Promise<Array<{ key: string; size: number; updatedAt: number }>>
   }
   export interface ClipboardAPI {
     read: () => Promise<ClipboardContent | undefined>
